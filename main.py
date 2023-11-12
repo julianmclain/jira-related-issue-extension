@@ -8,7 +8,9 @@ reference
 - Vector search with sqlite https://observablehq.com/@asg017/introducing-sqlite-vss
 - In order to enable sqlite extensions https://stackoverflow.com/a/60481356
 - sqlite-vss tutorial https://observablehq.com/@asg017/introducing-sqlite-vss
+- python bindings for sqlite-vss https://github.com/asg017/sqlite-vss/tree/main/bindings/python
 """
+
 import sqlite3
 import sqlite_vss
 from jira import JIRA
@@ -18,6 +20,7 @@ from sentence_transformers import SentenceTransformer, util
 from sentence_transformers.util import cos_sim
 
 import os
+from typing import Dict
 
 load_dotenv()
 
@@ -72,13 +75,17 @@ def save_all_jira_issues(db) -> int:
     total_hits = 0
     last_hits = None
 
-    while last_hits != 0: 
+    while last_hits != 0:
         issues = query_jira(
-            "type = 'On Call Question' and created > -180d and created < -30d", 10, total_hits 
+            "type = 'On Call Question' and created > -180d and created < -30d",
+            10,
+            total_hits,
         )
-        issue_summaries = [create_and_save_issue_summary(db, i) for i in issues]
+        simple_issues = [create_simple_issue(db, i) for i in issues]
+        for si in simple_issues:
+            insert_issue(db, si)
 
-        hits = len(issues) 
+        hits = len(issues)
         total_hits += hits
         last_hits = hits
         print(f"processed {last_hits} hits")
@@ -96,27 +103,31 @@ def query_jira(qs: str, max_results: int = 1, start_at: int = 0):
     )
 
 
-def create_and_save_issue_summary(db, issue: Issue, include_comments=True):
+def create_simple_issue(db, issue: Issue, include_comments=True):
     raw_issue = issue.raw
-    fields = raw_issue["fields"]
-    summary_items = [raw_issue["key"]]
-    summary_items.append((fields["summary"] or ""))
-    summary_items.append((fields["description"] or ""))
-    summary_items += fields["labels"]
-    summary_items += [f["name"] for f in fields["components"]]
-    if include_comments:
-        summary_items += [f["body"] for f in fields["comment"]["comments"]]
+    all_fields = raw_issue["fields"]
 
-    summary_string = ". ".join(summary_items)
+    simple_issue = {}
+    simple_issue["key"] = raw_issue["key"]
+    simple_issue["summary"] = all_fields["summary"]
+    simple_issue["description"] = all_fields["description"]
+    simple_issue["labels"] = " ".join([f["name"] for f in all_fields["components"]])
+    if include_comments:
+        simple_issue["comments"] = " ".join(
+            [f["body"] for f in all_fields["comment"]["comments"]]
+        )
+
+    return simple_issue
+
+
+def insert_issue(db, simple_issue: Dict[str, str]):
+    summary_string = ". ".join(list(simple_issue.values()))
     db.execute(
         "INSERT INTO issues (key, summary) values (?, ?)",
-        (raw_issue["key"], summary_string)
+        (simple_issue["key"], summary_string),
     )
     db.commit()
-    return summary_string
 
-def insert_issue(db, key: str, summary: str):
-    pass
 
 def create_issue_table(db) -> None:
     db.execute(
@@ -130,23 +141,30 @@ def create_issue_table(db) -> None:
     )
 
 
-if __name__ == "__main__":
-    db = sqlite3.connect("jira-issue-embeddings.db")
-    db.enable_load_extension(True)
-    create_issue_table(db)
-    save_all_jira_issues(db)
-    # create all embeddings
-
-    # model = SentenceTransformer('all-MiniLM-L6-v2')
+def insert_embeddings(db, model) -> None:
+    query = db.execute(
+        """
+            SELECT * FROM issues WHERE embedding IS NULL
+        """
+    )
+    issues = query.fetchall()
+    print(f"got {len(issues)} issues")
     # embeddings = model.encode(issue_summaries)
     # for sentence, embedding in zip(issue_summaries, embeddings):
     #     print("Sentence:", sentence)
     #     print("Embedding:", embedding)
     #     print("")
 
-    sqlite_vss.load(db)
 
-    # next steps
-    # - store tickets in sqlite so you don't need to query every time
-    # - test https://github.com/asg017/sqlite-vss/tree/main/bindings/python
+if __name__ == "__main__":
+    db = sqlite3.connect("jira-issue-embeddings.db")
+    db.enable_load_extension(True)
+
+    # create_issue_table(db)
+    # save_all_jira_issues(db)
+
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    insert_embeddings(db, model)
+
+    sqlite_vss.load(db)
     db.close
