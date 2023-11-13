@@ -13,77 +13,33 @@ reference
 
 import sqlite3
 import sqlite_vss
+from sqlite3 import Connection
 from jira import JIRA
 from jira.resources import Issue
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer, util
 from sentence_transformers.util import cos_sim
 
+import sys
 import os
-from typing import Dict
-
-load_dotenv()
-
-JIRA_HOST = "https://iterable.atlassian.net/"
-jira = JIRA(
-    server=JIRA_HOST,
-    basic_auth=(os.getenv("JIRA_USERNAME"), os.getenv("JIRA_API_TOKEN")),
-)
-
-# JIRA settings
-children = True  # @param {type:"boolean"}
-ancestors = True  # @param {type:"boolean"}
-issuetypes = True  # @param {type:"boolean"}
-names = True  # @param {type: "boolean"}
-changelog = False  # @param {type:"boolean"}
-renderedFields = False  # @param {type:"boolean"}
-operations = False  # @param {type:"boolean"}
-editmeta = False  # @param {type:"boolean"}
-versionedRepresentations = False  # @param {type:"boolean"}
-
-EXPAND_NAMES = set(
-    [
-        "issuetypes",
-        "names",
-        "ancestors",
-        "children",
-        "operations",
-        "versionedRepresentations",
-        "editmeta",
-        "changelog",
-        "renderedFields",
-    ]
-)
-API_OPTIONS = ",".join([f for f in EXPAND_NAMES if globals()[f]])
-FIELD_MAP = {"_".join(f["name"].lower().split()): f["key"] for f in jira.fields()}
-FIELDS = [
-    "key",
-    "summary",
-    "issuetype",
-    "components",
-    "created",
-    "resolved",
-    "description",
-    "labels",
-    "priority",
-    "comment",
-]
-FIELD_LIST = sorted([FIELD_MAP.get(f, f) for f in FIELDS])
+import traceback
+from typing import Dict, List
 
 
-def save_all_jira_issues(db) -> int:
+def save_embeddings(
+    query_string: str, jira: JIRA, db: Connection, model: SentenceTransformer
+) -> int:
     total_hits = 0
     last_hits = None
 
     while last_hits != 0:
-        issues = query_jira(
-            "type = 'On Call Question' and created > -180d and created < -30d",
+        issues = search_jira_paginated(
+            jira,
+            query_string,
             10,
             total_hits,
         )
-        simple_issues = [create_simple_issue(db, i) for i in issues]
-        for si in simple_issues:
-            insert_issue(db, si)
+        handle_search_page(db, issues)
 
         hits = len(issues)
         total_hits += hits
@@ -93,17 +49,54 @@ def save_all_jira_issues(db) -> int:
     return total_hits
 
 
-def query_jira(qs: str, max_results: int = 1, start_at: int = 0):
+def search_jira_paginated(
+    jira: JIRA, qs: str, max_results: int = 100, start_at: int = 0
+):
+    expand_fields = {
+        "children": True,  # @param {type:"boolean"}
+        "ancestors": True,  # @param {type:"boolean"}
+        "issuetypes": True,  # @param {type:"boolean"}
+        "names": True,  # @param {type: "boolean"}
+        "changelog": False,  # @param {type:"boolean"}
+        "renderedFields": False,  # @param {type:"boolean"}
+        "operations": False,  # @param {type:"boolean"}
+        "editmeta": False,  # @param {type:"boolean"}
+        "versionedRepresentations": False,  # @param {type:"boolean"}
+    }
+
+    FIELD_MAP = {"_".join(f["name"].lower().split()): f["key"] for f in jira.fields()}
+    FIELDS = [
+        "key",
+        "summary",
+        "issuetype",
+        "components",
+        "created",
+        "resolved",
+        "description",
+        "labels",
+        "priority",
+        "comment",
+    ]
+    FIELD_LIST = sorted([FIELD_MAP.get(f, f) for f in FIELDS])
+
     return jira.search_issues(
         qs,
         maxResults=max_results,
         startAt=start_at,
-        expand=API_OPTIONS,
+        expand=expand_fields,
         fields=FIELD_LIST,
     )
 
 
-def create_simple_issue(db, issue: Issue, include_comments=True):
+def handle_search_page(db: Connection, issues: List[Issue]) -> None:
+    for issue in issues:
+        simple_issue = create_simple_issue(issue)
+        issue_string = ". ".join(list(simple_issue.values()))
+        embedding = model.encode(issue_string)
+        insert_issue(db, simple_issue, embedding.tobytes())
+
+
+def create_simple_issue(issue: Issue, include_comments=True):
     raw_issue = issue.raw
     all_fields = raw_issue["fields"]
 
@@ -120,51 +113,51 @@ def create_simple_issue(db, issue: Issue, include_comments=True):
     return simple_issue
 
 
-def insert_issue(db, simple_issue: Dict[str, str]):
-    summary_string = ". ".join(list(simple_issue.values()))
-    db.execute(
-        "INSERT INTO issues (key, summary) values (?, ?)",
-        (simple_issue["key"], summary_string),
-    )
-    db.commit()
+def connect_to_db() -> Connection:
+    db = sqlite3.connect("jira-issue-embeddings.db")
+    db.enable_load_extension(True)
+    create_issue_table(db)
+    return db
 
 
-def create_issue_table(db) -> None:
+def create_issue_table(db: Connection) -> None:
     db.execute(
         """
             CREATE TABLE IF NOT EXISTS issues(
-                key TEXT NOT NULL,
-                summary TEXT NOT NULL,
+                id INTEGER PRIMARY KEY,
+                jira_key TEXT UNIQUE,
                 embedding BLOB
             )
         """
     )
 
 
-def insert_embeddings(db, model) -> None:
-    query = db.execute(
-        """
-            SELECT * FROM issues WHERE embedding IS NULL
-        """
+def insert_issue(
+    db: Connection, simple_issue: Dict[str, str], embedding: bytes
+) -> None:
+    db.execute(
+        "INSERT INTO issues (id, jira_key, embedding) values (?, ?, ?)",
+        (None, simple_issue["key"], embedding),
     )
-    issues = query.fetchall()
-    print(f"got {len(issues)} issues")
-    # embeddings = model.encode(issue_summaries)
-    # for sentence, embedding in zip(issue_summaries, embeddings):
-    #     print("Sentence:", sentence)
-    #     print("Embedding:", embedding)
-    #     print("")
+    db.commit()
 
 
 if __name__ == "__main__":
-    db = sqlite3.connect("jira-issue-embeddings.db")
-    db.enable_load_extension(True)
+    load_dotenv()
+    try:
+        db = connect_to_db()
+        jira = JIRA(
+            server="https://iterable.atlassian.net/",
+            basic_auth=(os.getenv("JIRA_USERNAME"), os.getenv("JIRA_API_TOKEN")),
+        )
+        query = "type = 'On Call Question' and created > -180d and created < -30d"
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        save_embeddings(query, jira, db, model)
+        # sqlite_vss.load(db)
 
-    # create_issue_table(db)
-    # save_all_jira_issues(db)
+    except Exception as e:
+        print(traceback.format_exc())
+        sys.exit(1)
 
-    model = SentenceTransformer("all-MiniLM-L6-v2")
-    insert_embeddings(db, model)
-
-    sqlite_vss.load(db)
-    db.close
+    finally:
+        db.close
