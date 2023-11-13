@@ -1,24 +1,9 @@
-"""
-reference
-- https://github.com/huggingface/transformers
-- https://www.sbert.net/
-- https://jira.readthedocs.io/
-- Embeddings tutorial https://www.youtube.com/watch?v=QdDoFfkVkcw
-- Pete's notebook https://colab.research.google.com/drive/1UP5ttpgtiRzLcr_3x4Q5rIcIwyPBNUJp#scrollTo=dIQJliStfDlJ
-- Vector search with sqlite https://observablehq.com/@asg017/introducing-sqlite-vss
-- In order to enable sqlite extensions https://stackoverflow.com/a/60481356
-- sqlite-vss tutorial https://observablehq.com/@asg017/introducing-sqlite-vss
-- python bindings for sqlite-vss https://github.com/asg017/sqlite-vss/tree/main/bindings/python
-"""
-
 import sqlite3
-import sqlite_vss
 from sqlite3 import Connection
 from jira import JIRA
 from jira.resources import Issue
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer, util
-from sentence_transformers.util import cos_sim
 
 import sys
 import os
@@ -39,7 +24,7 @@ def save_embeddings(
             10,
             total_hits,
         )
-        handle_search_page(db, issues)
+        handle_search_page(db, model, issues)
 
         hits = len(issues)
         total_hits += hits
@@ -53,15 +38,15 @@ def search_jira_paginated(
     jira: JIRA, qs: str, max_results: int = 100, start_at: int = 0
 ):
     expand_fields = {
-        "children": True,  # @param {type:"boolean"}
-        "ancestors": True,  # @param {type:"boolean"}
-        "issuetypes": True,  # @param {type:"boolean"}
-        "names": True,  # @param {type: "boolean"}
-        "changelog": False,  # @param {type:"boolean"}
-        "renderedFields": False,  # @param {type:"boolean"}
-        "operations": False,  # @param {type:"boolean"}
-        "editmeta": False,  # @param {type:"boolean"}
-        "versionedRepresentations": False,  # @param {type:"boolean"}
+        "children": True,
+        "ancestors": True,
+        "issuetypes": True,
+        "names": True,
+        "changelog": False,
+        "renderedFields": False,
+        "operations": False,
+        "editmeta": False,
+        "versionedRepresentations": False,
     }
 
     FIELD_MAP = {"_".join(f["name"].lower().split()): f["key"] for f in jira.fields()}
@@ -88,7 +73,9 @@ def search_jira_paginated(
     )
 
 
-def handle_search_page(db: Connection, issues: List[Issue]) -> None:
+def handle_search_page(
+    db: Connection, model: SentenceTransformer, issues: List[Issue]
+) -> None:
     for issue in issues:
         simple_issue = create_simple_issue(issue)
         issue_string = ". ".join(list(simple_issue.values()))
@@ -96,7 +83,7 @@ def handle_search_page(db: Connection, issues: List[Issue]) -> None:
         insert_issue(db, simple_issue, embedding.tobytes())
 
 
-def create_simple_issue(issue: Issue, include_comments=True):
+def create_simple_issue(issue: Issue, include_comments: bool = True):
     raw_issue = issue.raw
     all_fields = raw_issue["fields"]
 
@@ -113,10 +100,9 @@ def create_simple_issue(issue: Issue, include_comments=True):
     return simple_issue
 
 
-def connect_to_db() -> Connection:
-    db = sqlite3.connect("jira-issue-embeddings.db")
+def connect_to_db(name: str) -> Connection:
+    db = sqlite3.connect(name)
     db.enable_load_extension(True)
-    create_issue_table(db)
     return db
 
 
@@ -145,15 +131,20 @@ def insert_issue(
 if __name__ == "__main__":
     load_dotenv()
     try:
-        db = connect_to_db()
+        db_name = "jira-issue-embeddings.db"
+        db = connect_to_db(db_name)
+        create_issue_table(db)
+
         jira = JIRA(
             server="https://iterable.atlassian.net/",
             basic_auth=(os.getenv("JIRA_USERNAME"), os.getenv("JIRA_API_TOKEN")),
         )
+
         query = "type = 'On Call Question' and created > -180d and created < -30d"
+
         model = SentenceTransformer("all-MiniLM-L6-v2")
+
         save_embeddings(query, jira, db, model)
-        # sqlite_vss.load(db)
 
     except Exception as e:
         print(traceback.format_exc())
